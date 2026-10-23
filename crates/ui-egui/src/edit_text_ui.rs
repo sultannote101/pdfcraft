@@ -1394,7 +1394,9 @@ pub(crate) fn install_source_fonts(ctx: &egui::Context, doc: &pdfcraft_engine::D
 }
 
 fn editor_job(ui: &egui::Ui, ed: &LineEditor, text: &str, scale: f32, width: f32) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
+    // The editor holds the line in typing order (`crates/edit/src/bidi.rs`), so lay it out
+    // bidirectionally: Arabic and Hebrew read right to left while they are edited.
+    let mut job = egui::text::LayoutJob { bidi: true, ..Default::default() };
     // An unchanged PDF row already has an authoritative line break. Do not rewrap it
     // because font rounding or a fallback face measures a fraction of a pixel wider.
     job.wrap.max_width = if text == ed.original && ed.look == ed.look0 && ed.extras == ed.extras0 { f32::INFINITY } else { width };

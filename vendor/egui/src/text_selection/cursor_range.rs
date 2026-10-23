@@ -119,6 +119,8 @@ impl CCursorRange {
             }
 
             Key::ArrowLeft | Key::ArrowRight if modifiers.is_none() && !self.is_empty() => {
+                // PdfCraft patch: in right-to-left text, ← goes to the logical end.
+                let key = visual_arrow(galley, &self.primary, key);
                 if key == Key::ArrowLeft {
                     *self = Self::one(self.sorted_cursors()[0]);
                 } else {
@@ -252,6 +254,16 @@ fn ccursor_from_accesskit_text_position(
 
 // ----------------------------------------------------------------------------
 
+/// PdfCraft patch: ← and → move the cursor the way they point on screen, so in right-to-left
+/// text (Arabic, Hebrew …) they move it toward the logical end and start.
+fn visual_arrow(galley: &Galley, cursor: &CCursor, key: Key) -> Key {
+    match key {
+        Key::ArrowLeft if galley.is_rtl_at(cursor) => Key::ArrowRight,
+        Key::ArrowRight if galley.is_rtl_at(cursor) => Key::ArrowLeft,
+        _ => key,
+    }
+}
+
 /// Move a text cursor based on keyboard
 fn move_single_cursor(
     os: OperatingSystem,
@@ -261,6 +273,8 @@ fn move_single_cursor(
     key: Key,
     modifiers: &Modifiers,
 ) {
+    // PdfCraft patch: see `visual_arrow`.
+    let key = visual_arrow(galley, cursor, key);
     let (new_cursor, new_h_pos) =
         if os == OperatingSystem::Mac && modifiers.ctrl && !modifiers.shift {
             match key {

@@ -47,13 +47,20 @@ pub fn paint_text_selection(
         let placed_row = &mut galley.rows[ri];
         let row = Arc::make_mut(&mut placed_row.row);
 
+        // PdfCraft patch: a right-to-left row starts on its right and ends on its left, so a
+        // selection running past either end of it takes that end's place, not 0 or the width.
+        let bidi = row.is_bidi();
         let left = if ri == min.row {
             row.x_offset(min.column)
+        } else if bidi {
+            row.x_offset(CharIndex(0))
         } else {
             0.0
         };
         let right = if ri == max.row {
             row.x_offset(max.column)
+        } else if bidi {
+            row.x_offset(row.char_count_excluding_newline())
         } else {
             let newline_size = if placed_row.ends_with_newline {
                 row.height() / 2.0 // visualize that we select the newline
@@ -241,16 +248,25 @@ fn paint_underlines(
         let placed_row = &galley.rows[ri];
         let row = &placed_row.row;
 
-        let left = if ri == min.row {
-            row.x_offset(min.column)
-        } else {
-            0.0
-        };
-        let right = if ri == max.row {
-            row.x_offset(max.column)
-        } else {
-            row.size.x
-        };
+        // PdfCraft patch: as in `paint_text_selection`, and the row's own offset (a right-aligned
+        // right-to-left row does not start at 0).
+        let bidi = row.is_bidi();
+        let left = placed_row.pos.x
+            + if ri == min.row {
+                row.x_offset(min.column)
+            } else if bidi {
+                row.x_offset(CharIndex(0))
+            } else {
+                0.0
+            };
+        let right = placed_row.pos.x
+            + if ri == max.row {
+                row.x_offset(max.column)
+            } else if bidi {
+                row.x_offset(row.char_count_excluding_newline())
+            } else {
+                row.size.x
+            };
 
         let offset_y = placed_row.pos.y + row.size.y;
 

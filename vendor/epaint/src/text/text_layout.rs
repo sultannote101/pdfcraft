@@ -81,6 +81,10 @@ struct Paragraph {
 
     /// In case of an empty paragraph ("\n"), use this as height.
     pub empty_paragraph_height: f32,
+
+    /// PdfCraft patch: the paragraph runs right to left (its first strong character is
+    /// right to left). Only set with [`LayoutJob::bidi`].
+    pub base_rtl: bool,
 }
 
 impl Paragraph {
@@ -90,8 +94,84 @@ impl Paragraph {
             section_index_at_start,
             glyphs: vec![],
             empty_paragraph_height: 0.0,
+            base_rtl: false,
         }
     }
+}
+
+/// PdfCraft patch: the bidirectional levels of a [`LayoutJob`]'s text (UAX #9), when it has any
+/// right-to-left characters and asks for them ([`LayoutJob::bidi`]).
+struct BidiLevels {
+    /// The embedding level of every byte of the text.
+    levels: Vec<u8>,
+
+    /// The byte range and direction of every paragraph.
+    paragraphs: Vec<(Range<usize>, bool)>,
+}
+
+impl BidiLevels {
+    fn new(job: &LayoutJob) -> Option<Self> {
+        use unicode_bidi::{BidiClass, BidiInfo, bidi_class};
+        if !job.bidi {
+            return None;
+        }
+        // Left-to-right text lays out exactly as before: no levels, no reordering.
+        let any_rtl = job.text.chars().any(|c| {
+            matches!(
+                bidi_class(c),
+                BidiClass::R
+                    | BidiClass::AL
+                    | BidiClass::AN
+                    | BidiClass::RLE
+                    | BidiClass::RLO
+                    | BidiClass::RLI
+            )
+        });
+        if !any_rtl {
+            return None;
+        }
+        let info = BidiInfo::new(&job.text, None);
+        Some(Self {
+            levels: info.levels.iter().map(|l| l.number()).collect(),
+            paragraphs: info
+                .paragraphs
+                .iter()
+                .map(|p| (p.range.clone(), p.level.is_rtl()))
+                .collect(),
+        })
+    }
+
+    /// The level of the byte at `index` of the job's text (0 past the end).
+    fn level(&self, index: usize) -> u8 {
+        self.levels.get(index).copied().unwrap_or(0)
+    }
+
+    /// Whether the paragraph holding byte `index` runs right to left.
+    fn paragraph_rtl(&self, index: usize) -> bool {
+        self.paragraphs
+            .iter()
+            .find(|(range, _)| range.start <= index && index < range.end.max(range.start + 1))
+            .or_else(|| self.paragraphs.last())
+            .is_some_and(|(_, rtl)| *rtl)
+    }
+}
+
+/// PdfCraft patch: whether `text` is a right-to-left paragraph by the Unicode Bidirectional
+/// Algorithm's rule (P2, P3): its first strong character (ignoring isolates) is right to left.
+pub fn starts_right_to_left(text: &str) -> bool {
+    use unicode_bidi::{BidiClass, bidi_class};
+    let mut isolates = 0usize;
+    for c in text.chars() {
+        match bidi_class(c) {
+            BidiClass::LRI | BidiClass::RLI | BidiClass::FSI => isolates += 1,
+            BidiClass::PDI => isolates = isolates.saturating_sub(1),
+            BidiClass::B => return false,
+            BidiClass::L if isolates == 0 => return false,
+            BidiClass::R | BidiClass::AL if isolates == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Layout text into a [`Galley`].
@@ -120,7 +200,15 @@ pub fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>)
 
     // For most of this we ignore the y coordinate:
 
+    // PdfCraft patch: bidirectional levels, when the job asks for them and needs them.
+    let bidi = BidiLevels::new(&job);
+
     let mut paragraphs = vec![Paragraph::from_section_index(0)];
+    if let Some(bidi) = &bidi
+        && let Some(first) = paragraphs.first_mut()
+    {
+        first.base_rtl = bidi.paragraph_rtl(0);
+    }
     {
         let mut shape_buffer = fonts.take_shape_buffer();
         for (section_index, section) in job.sections.iter().enumerate() {
@@ -133,6 +221,7 @@ pub fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>)
                 section_index as u32,
                 section,
                 &mut paragraphs,
+                bidi.as_ref(),
             );
         }
         fonts.return_shape_buffer(shape_buffer);
@@ -142,13 +231,42 @@ pub fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>)
 
     let intrinsic_size = calculate_intrinsic_size(point_scale, &job, &paragraphs);
 
+    // PdfCraft patch: rows are broken in logical order, so right-to-left runs get logical
+    // positions first (their shaped positions are kept for putting each row in visual order).
+    if bidi.is_some() {
+        for paragraph in &mut paragraphs {
+            logical_positions(&mut paragraph.glyphs);
+        }
+    }
+
     let mut elided = false;
-    let mut rows = rows_from_paragraphs(paragraphs, &job, pixels_per_point, &mut elided);
+    let mut row_rtl = Vec::new();
+    let mut rows = rows_from_paragraphs(
+        paragraphs,
+        &job,
+        pixels_per_point,
+        &mut elided,
+        &mut row_rtl,
+    );
     if elided && let Some(last_placed) = rows.last_mut() {
         let last_row = Arc::make_mut(&mut last_placed.row);
         replace_last_glyph_with_overflow_character(fonts, pixels_per_point, &job, last_row);
         if let Some(last) = last_row.glyphs.last() {
             last_row.size.x = last.max_x();
+        }
+    }
+
+    // PdfCraft patch: each row in visual order, and right-to-left paragraphs right-aligned.
+    if bidi.is_some() {
+        for (placed_row, &rtl) in rows.iter_mut().zip(&row_rtl) {
+            if rtl || placed_row.row.is_bidi() {
+                let row = Arc::make_mut(&mut placed_row.row);
+                visual_order(row, rtl);
+            }
+            if rtl && job.halign == Align::LEFT && !job.justify && job.wrap.max_width.is_finite()
+            {
+                placed_row.pos.x = (job.wrap.max_width - placed_row.row.size.x).at_least(0.0);
+            }
         }
     }
 
@@ -184,6 +302,10 @@ struct ShapingContext {
     font_metrics: StyledMetrics,
     is_first_glyph_in_section: bool,
     prev_cluster: Option<u32>,
+
+    /// PdfCraft patch: the bidi level and id of the run being shaped.
+    bidi_level: u8,
+    bidi_run: u32,
 }
 
 impl ShapingContext {
@@ -207,6 +329,9 @@ impl ShapingContext {
             uv_rect,
             section_index: self.section_index,
             first_vertex: 0,
+            bidi_level: self.bidi_level,
+            bidi_run: self.bidi_run,
+            bidi_x: physical_x as f32 / self.pixels_per_point,
         }
     }
 }
@@ -219,6 +344,9 @@ struct TextRun {
 
     /// Byte range within the section text.
     byte_range: ByteRange,
+
+    /// PdfCraft patch: the bidi level of the run (0 without [`LayoutJob::bidi`]).
+    level: u8,
 }
 
 /// Emit shaped glyphs from a [`harfrust::GlyphBuffer`] into a [`Paragraph`].
@@ -246,6 +374,25 @@ fn layout_shaped_run(
     // continuation glyphs when a cluster has more chars than glyphs.
     let mut cluster_start_byte: usize = 0;
     let mut cluster_glyph_count: usize = 0;
+
+    // PdfCraft patch: a right-to-left run comes out of the shaper in visual order. Remember
+    // where each glyph's character is in the text, to put the glyphs back in logical order.
+    let rtl = ctx.bidi_level % 2 == 1;
+    let first_glyph = paragraph.glyphs.len();
+    let mut logical_keys: Vec<u32> = Vec::new();
+
+    // PdfCraft patch: a cluster's text runs up to the next cluster *in the text*. In a
+    // right-to-left run the shaper's clusters descend, so "the next glyph's cluster" (what was
+    // used here) is before it, and the run's last glyph (cluster 0) took the whole run as its
+    // cluster, emitting every character again as continuation glyphs.
+    let mut cluster_starts: Vec<usize> =
+        glyph_buffer.glyph_infos().iter().map(|info| info.cluster as usize).collect();
+    cluster_starts.sort_unstable();
+    cluster_starts.dedup();
+    let cluster_end = |start: usize| -> usize {
+        let next = cluster_starts.partition_point(|&c| c <= start);
+        cluster_starts.get(next).copied().unwrap_or(run_text.len())
+    };
 
     for (info, pos) in iter::zip(glyph_buffer.glyph_infos(), glyph_buffer.glyph_positions()) {
         let glyph_id = skrifa::GlyphId::new(info.glyph_id);
@@ -288,9 +435,10 @@ fn layout_shaped_run(
                     ctx,
                     paragraph,
                     run_text,
-                    cluster_start_byte..cluster as usize,
+                    cluster_start_byte..cluster_end(cluster_start_byte),
                     cluster_glyph_count,
                     face_metrics,
+                    rtl.then_some(&mut logical_keys),
                 );
             }
             if !ctx.is_first_glyph_in_section {
@@ -377,6 +525,9 @@ fn layout_shaped_run(
             )
         };
         paragraph.glyphs.push(glyph);
+        if rtl {
+            logical_keys.push(cluster);
+        }
         cluster_glyph_count += 1;
     }
 
@@ -386,11 +537,168 @@ fn layout_shaped_run(
             ctx,
             paragraph,
             run_text,
-            cluster_start_byte..run_text.len(),
+            cluster_start_byte..cluster_end(cluster_start_byte),
             cluster_glyph_count,
             face_metrics,
+            rtl.then_some(&mut logical_keys),
         );
     }
+
+    if rtl {
+        to_logical_order(&mut paragraph.glyphs, first_glyph, &logical_keys);
+    }
+}
+
+/// PdfCraft patch: put the glyphs of a right-to-left run (from `first` on, in the shaper's
+/// visual order) into the logical order of their characters: by the text position each one
+/// stands for (`keys`), glyphs of one cluster in reverse visual order. Positions are kept.
+fn to_logical_order(glyphs: &mut Vec<Glyph>, first: usize, keys: &[u32]) {
+    let Some(run) = glyphs.get(first..) else {
+        return;
+    };
+    // Only when every glyph has its key; otherwise leave the run as it is.
+    if run.len() != keys.len() {
+        return;
+    }
+    let mut order: Vec<usize> = (0..run.len()).collect();
+    order.sort_by_key(|&i| (keys.get(i).copied().unwrap_or(u32::MAX), core::cmp::Reverse(i)));
+    let reordered: Vec<Glyph> = order.iter().filter_map(|&i| run.get(i).copied()).collect();
+    glyphs.truncate(first);
+    glyphs.extend(reordered);
+}
+
+/// PdfCraft patch: give the glyphs of every right-to-left run logical positions, so rows can
+/// be broken in logical order: each run starts where its leftmost glyph was drawn, and its
+/// characters follow one another by their advances. `bidi_x` keeps the shaped positions.
+fn logical_positions(glyphs: &mut [Glyph]) {
+    let mut i = 0;
+    while i < glyphs.len() {
+        let Some(first) = glyphs.get(i).copied() else {
+            break;
+        };
+        let mut end = i + 1;
+        while glyphs
+            .get(end)
+            .is_some_and(|g| g.bidi_run == first.bidi_run && g.bidi_level == first.bidi_level)
+        {
+            end += 1;
+        }
+        if first.is_rtl()
+            && let Some(run) = glyphs.get_mut(i..end)
+        {
+            let start = run.iter().map(|g| g.pos.x).fold(f32::INFINITY, f32::min);
+            let mut x = start;
+            for glyph in run {
+                glyph.pos.x = x;
+                x += glyph.advance_width;
+            }
+        }
+        i = end;
+    }
+}
+
+/// PdfCraft patch: put a row (glyphs in logical order, at logical positions) in visual order
+/// by the Unicode Bidirectional Algorithm's reordering (UAX #9 L1, L2). The glyphs stay in
+/// logical order; only their x positions change. A row of a right-to-left paragraph
+/// (`rtl`) takes level 1 as its base, which trailing whitespace falls back to (L1).
+fn visual_order(row: &mut Row, rtl: bool) {
+    struct Segment {
+        glyphs: Range<usize>,
+        level: u8,
+        width: f32,
+    }
+    let base = u8::from(rtl);
+    let trailing_whitespace = row
+        .glyphs
+        .iter()
+        .rev()
+        .take_while(|g| g.chr.is_whitespace())
+        .count();
+    let trailing_start = row.glyphs.len() - trailing_whitespace;
+    // The level each glyph is laid out at, and where it sits within its segment.
+    let level_at = |i: usize, g: &Glyph| if i >= trailing_start { base } else { g.bidi_level };
+    let Some(x0) = row.glyphs.first().map(|g| g.pos.x) else {
+        return;
+    };
+
+    // Segments: maximal stretches from one shaped run at one level.
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut offsets = vec![0.0f32; row.glyphs.len()];
+    let mut i = 0;
+    while i < row.glyphs.len() {
+        let Some(first) = row.glyphs.get(i).copied() else {
+            break;
+        };
+        let level = level_at(i, &first);
+        let mut end = i + 1;
+        while row
+            .glyphs
+            .get(end)
+            .is_some_and(|g| g.bidi_run == first.bidi_run && level_at(end, g) == level)
+        {
+            end += 1;
+        }
+        let Some(glyphs) = row.glyphs.get(i..end) else {
+            break;
+        };
+        // A right-to-left stretch keeps the shaper's visual arrangement; anything else (and
+        // whitespace moved to the base level) runs left to right by its logical positions.
+        let shaped = first.is_rtl() && level % 2 == 1;
+        let x_of = |g: &Glyph| if shaped { g.bidi_x } else { g.pos.x };
+        let min = glyphs.iter().map(x_of).fold(f32::INFINITY, f32::min);
+        let max = glyphs
+            .iter()
+            .map(|g| x_of(g) + g.advance_width)
+            .fold(f32::NEG_INFINITY, f32::max);
+        for (k, g) in glyphs.iter().enumerate() {
+            if let Some(o) = offsets.get_mut(i + k) {
+                *o = x_of(g) - min;
+            }
+        }
+        let width = if min.is_finite() && max.is_finite() { (max - min).at_least(0.0) } else { 0.0 };
+        segments.push(Segment { glyphs: i..end, level, width });
+        i = end;
+    }
+
+    // L2: from the highest level down to the lowest odd level, reverse every sequence of
+    // segments at that level or higher.
+    let highest = segments.iter().map(|s| s.level).max().unwrap_or(0);
+    let lowest_odd = segments
+        .iter()
+        .map(|s| s.level)
+        .filter(|l| l % 2 == 1)
+        .min()
+        .unwrap_or(highest.saturating_add(1));
+    let mut level = highest;
+    while level >= lowest_odd && level > 0 {
+        let mut k = 0;
+        while k < segments.len() {
+            if segments.get(k).is_some_and(|s| s.level >= level) {
+                let mut end = k + 1;
+                while segments.get(end).is_some_and(|s| s.level >= level) {
+                    end += 1;
+                }
+                if let Some(run) = segments.get_mut(k..end) {
+                    run.reverse();
+                }
+                k = end;
+            } else {
+                k += 1;
+            }
+        }
+        level -= 1;
+    }
+
+    let mut x = x0;
+    for segment in &segments {
+        for i in segment.glyphs.clone() {
+            if let (Some(glyph), Some(offset)) = (row.glyphs.get_mut(i), offsets.get(i)) {
+                glyph.pos.x = x + offset;
+            }
+        }
+        x += segment.width;
+    }
+    row.size.x = x;
 }
 
 /// Emit zero-width continuation glyphs when a cluster has more characters than
@@ -406,7 +714,9 @@ fn emit_continuation_glyphs(
     cluster_bytes: Range<usize>,
     cluster_glyph_count: usize,
     face_metrics: &StyledMetrics,
+    mut logical_keys: Option<&mut Vec<u32>>,
 ) {
+    let cluster_start = cluster_bytes.start;
     let Some(cluster_text) = run_text.get(cluster_bytes) else {
         return;
     };
@@ -417,10 +727,14 @@ fn emit_continuation_glyphs(
 
     let physical_x = paragraph.cursor_x_px.round() as i32;
 
-    for chr in cluster_text.chars().skip(cluster_glyph_count) {
+    for (offset, chr) in cluster_text.char_indices().skip(cluster_glyph_count) {
         paragraph
             .glyphs
             .push(ctx.glyph(chr, physical_x, 0.0, face_metrics, UvRect::default()));
+        // PdfCraft patch: where this character is, for a right-to-left run's logical order.
+        if let Some(keys) = logical_keys.as_deref_mut() {
+            keys.push(u32::try_from(cluster_start + offset).unwrap_or(u32::MAX));
+        }
     }
 }
 
@@ -434,6 +748,7 @@ fn layout_section(
     section_index: u32,
     section: &LayoutSection,
     out_paragraphs: &mut Vec<Paragraph>,
+    bidi: Option<&BidiLevels>,
 ) -> harfrust::UnicodeBuffer {
     let LayoutSection {
         leading_space,
@@ -465,22 +780,30 @@ fn layout_section(
         font_metrics,
         is_first_glyph_in_section: paragraph.glyphs.is_empty(),
         prev_cluster: None,
+        bidi_level: 0,
+        bidi_run: 0,
     };
     let mut runs = Vec::new();
 
     // Process each paragraph segment (split on newlines — the shaper can't handle them).
     for (seg_idx, segment) in SplitOrWhole::new(section_text, job.break_on_newline).enumerate() {
+        // PdfCraft patch: where this segment starts in the job's text, for its bidi levels.
+        let segment_start = byte_range.start.0
+            + (segment.as_ptr() as usize).saturating_sub(section_text.as_ptr() as usize);
         if 0 < seg_idx {
             paragraph = out_paragraphs.push_mut(Paragraph::from_section_index(section_index));
             paragraph.empty_paragraph_height = line_height;
             ctx.is_first_glyph_in_section = true;
+            if let Some(bidi) = bidi {
+                paragraph.base_rtl = bidi.paragraph_rtl(segment_start);
+            }
         }
 
         if segment.is_empty() {
             continue;
         }
 
-        segment_into_runs(font, segment, &mut runs);
+        segment_into_runs(font, segment, &mut runs, bidi, segment_start);
 
         let num_runs = runs.len();
         for (run_idx, run) in runs.iter().enumerate() {
@@ -501,7 +824,21 @@ fn layout_section(
                 flags |= harfrust::BufferFlags::END_OF_TEXT;
             }
 
-            let glyph_buffer = shape_text(font_face, run_text, &format.coords, shape_buffer, flags);
+            // PdfCraft patch: each run is shaped in its own direction, and its glyphs carry
+            // its level and an id (where it starts in the text).
+            let direction = bidi.map(|_| {
+                if run.level % 2 == 1 {
+                    harfrust::Direction::RightToLeft
+                } else {
+                    harfrust::Direction::LeftToRight
+                }
+            });
+            ctx.bidi_level = run.level;
+            ctx.bidi_run =
+                u32::try_from(segment_start + run.byte_range.start.0).unwrap_or(u32::MAX);
+
+            let glyph_buffer =
+                shape_text(font_face, run_text, &format.coords, shape_buffer, flags, direction);
 
             layout_shaped_run(
                 font,
@@ -587,12 +924,16 @@ fn rows_from_paragraphs(
     job: &LayoutJob,
     pixels_per_point: f32,
     elided: &mut bool,
+    row_rtl: &mut Vec<bool>,
 ) -> Vec<PlacedRow> {
     let num_paragraphs = paragraphs.len();
 
     let mut rows = vec![];
 
     for (i, paragraph) in paragraphs.into_iter().enumerate() {
+        // PdfCraft patch: every row this paragraph makes runs in its direction.
+        let base_rtl = paragraph.base_rtl;
+        row_rtl.resize(rows.len(), base_rtl);
         if job.wrap.max_rows <= rows.len() {
             *elided = true;
             break;
@@ -634,6 +975,7 @@ fn rows_from_paragraphs(
                 placed_row.ends_with_newline = !is_last_paragraph;
             }
         }
+        row_rtl.resize(rows.len(), base_rtl);
     }
 
     rows
@@ -836,6 +1178,9 @@ fn replace_last_glyph_with_overflow_character(
                 uv_rect: replacement_glyph_alloc.uv_rect,
                 section_index,
                 first_vertex: 0, // filled in later
+                bidi_level: 0,
+                bidi_run: u32::MAX,
+                bidi_x: physical_x as f32 / pixels_per_point,
             });
             return;
         }
@@ -891,6 +1236,27 @@ fn halign_and_justify_row(
     };
     let num_glyphs_in_range = glyph_range.1 - glyph_range.0;
     assert!(num_glyphs_in_range > 0, "Should have at least one glyph");
+
+    // PdfCraft patch: a bidi row's glyphs are in logical order but not left to right, so it is
+    // aligned as one block (not justified, which spreads glyphs in their stored order).
+    if row.is_bidi() {
+        let min_x = row.glyphs.iter().map(|g| g.pos.x).fold(f32::INFINITY, f32::min);
+        let max_x = row.glyphs.iter().map(|g| g.max_x()).fold(f32::NEG_INFINITY, f32::max);
+        if !(min_x.is_finite() && max_x.is_finite()) {
+            return;
+        }
+        let width = max_x - min_x;
+        placed_row.pos.x = point_scale.round_to_pixel(match halign {
+            Align::LEFT => 0.0,
+            Align::Center => -width / 2.0,
+            Align::RIGHT => -width,
+        });
+        for glyph in &mut row.glyphs {
+            glyph.pos.x = point_scale.round_to_pixel(glyph.pos.x - min_x);
+        }
+        row.size.x = width;
+        return;
+    }
 
     let original_min_x = row.glyphs[glyph_range.0].logical_rect().min.x;
     let original_max_x = row.glyphs[glyph_range.1 - 1].logical_rect().max.x;
@@ -1367,12 +1733,20 @@ impl RowBreakCandidates {
 ///
 /// Results are appended to `out` (which is cleared first) to allow
 /// the caller to reuse the allocation across calls.
-fn segment_into_runs(font: &mut Font<'_>, text: &str, out: &mut Vec<TextRun>) {
+fn segment_into_runs(
+    font: &mut Font<'_>,
+    text: &str,
+    out: &mut Vec<TextRun>,
+    bidi: Option<&BidiLevels>,
+    text_start: usize,
+) {
     use unicode_segmentation::UnicodeSegmentation as _;
 
     out.clear();
 
     for (byte_offset, grapheme_str) in text.grapheme_indices(true) {
+        // PdfCraft patch: a run also ends where the bidi level changes.
+        let level = bidi.map_or(0, |b| b.level(text_start + byte_offset));
         let byte_offset = ByteIndex(byte_offset);
         let byte_end = byte_offset + grapheme_str.len();
 
@@ -1381,6 +1755,7 @@ fn segment_into_runs(font: &mut Font<'_>, text: &str, out: &mut Vec<TextRun>) {
 
         if let Some(last_run) = out.last_mut()
             && last_run.font_key == font_key
+            && last_run.level == level
         {
             last_run.byte_range.end = byte_end;
             continue;
@@ -1388,6 +1763,7 @@ fn segment_into_runs(font: &mut Font<'_>, text: &str, out: &mut Vec<TextRun>) {
         out.push(TextRun {
             font_key,
             byte_range: byte_offset..byte_end,
+            level,
         });
     }
 }
@@ -1403,6 +1779,7 @@ fn shape_text(
     coords: &VariationCoords,
     mut buffer: harfrust::UnicodeBuffer,
     flags: harfrust::BufferFlags,
+    direction: Option<harfrust::Direction>,
 ) -> harfrust::GlyphBuffer {
     let font_ref = font_face.skrifa_font_ref();
     let tweak = font_face.tweak();
@@ -1429,6 +1806,11 @@ fn shape_text(
     buffer.set_flags(flags);
     buffer.push_str(text);
     buffer.guess_segment_properties();
+    // PdfCraft patch: the bidi level decides the direction, not the script alone (a space or
+    // a digit inside Arabic text runs with it).
+    if let Some(direction) = direction {
+        buffer.set_direction(direction);
+    }
 
     shaper.shape(buffer, harfrust::ShapeOptions::new())
 }
@@ -1935,4 +2317,5 @@ mod tests {
         let details: Vec<_> = glyphs.iter().map(|g| (g.chr, g.advance_width)).collect();
         (galley.size().x, glyphs.len(), details)
     }
+
 }

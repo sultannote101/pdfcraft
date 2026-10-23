@@ -94,6 +94,19 @@ pub struct LayoutJob {
     /// If `true`, trailing whitespace is included in the row width used for alignment.
     /// This is desirable for text editors where the user expects to see their spaces.
     pub keep_trailing_whitespace: bool,
+
+    /// PdfCraft patch: lay the text out with the Unicode Bidirectional Algorithm (UAX #9).
+    ///
+    /// The text is in logical (typing) order. Each paragraph takes its direction from its
+    /// first strong character, right-to-left runs (Arabic, Hebrew …) are shaped right to left,
+    /// rows are broken in logical order and then put in visual order, and a right-to-left
+    /// paragraph is right-aligned when [`Self::halign`] is `LEFT` and the wrap width is finite.
+    /// Glyphs stay in logical order (glyph `i` is character `i`), so cursors index the text as
+    /// before; [`Row::x_offset`] and [`Row::char_at`] place them on the right edge of a
+    /// right-to-left character.
+    ///
+    /// Default: `false` (the text is laid out left to right, as upstream egui does).
+    pub bidi: bool,
 }
 
 impl Default for LayoutJob {
@@ -109,6 +122,7 @@ impl Default for LayoutJob {
             justify: false,
             round_output_to_gui: true,
             keep_trailing_whitespace: false,
+            bidi: false,
         }
     }
 }
@@ -317,6 +331,7 @@ impl core::hash::Hash for LayoutJob {
             justify,
             round_output_to_gui,
             keep_trailing_whitespace,
+            bidi,
         } = self;
 
         text.hash(state);
@@ -328,6 +343,7 @@ impl core::hash::Hash for LayoutJob {
         justify.hash(state);
         round_output_to_gui.hash(state);
         keep_trailing_whitespace.hash(state);
+        bidi.hash(state);
     }
 }
 
@@ -924,6 +940,17 @@ pub struct Glyph {
 
     /// Which is our first vertex in [`RowVisuals::mesh`].
     pub first_vertex: u32,
+
+    /// PdfCraft patch: the bidirectional embedding level of this character (UAX #9). Odd is
+    /// right to left. Always `0` unless [`LayoutJob::bidi`] is set.
+    pub bidi_level: u8,
+
+    /// PdfCraft patch: which shaped run this glyph came from (only used during bidi layout).
+    pub(crate) bidi_run: u32,
+
+    /// PdfCraft patch: the x position the shaper gave this glyph within its paragraph, before
+    /// rows were broken (only used during bidi layout).
+    pub(crate) bidi_x: f32,
 }
 
 impl Glyph {
@@ -935,6 +962,12 @@ impl Glyph {
     #[inline]
     pub fn max_x(&self) -> f32 {
         self.pos.x + self.advance_width
+    }
+
+    /// PdfCraft patch: whether this character runs right to left ([`LayoutJob::bidi`]).
+    #[inline]
+    pub fn is_rtl(&self) -> bool {
+        self.bidi_level % 2 == 1
     }
 
     /// Same y range for all characters with the same [`TextFormat`].
@@ -961,6 +994,9 @@ impl Row {
     /// Closest char at the desired x coordinate in row-relative coordinates.
     /// Returns something in the range `[0, char_count_excluding_newline()]`.
     pub fn char_at(&self, desired_x: f32) -> CharIndex {
+        if self.is_bidi() {
+            return self.bidi_char_at(desired_x);
+        }
         for (i, glyph) in self.glyphs.iter().enumerate() {
             if desired_x < glyph.logical_rect().center().x {
                 return CharIndex(i);
@@ -971,10 +1007,62 @@ impl Row {
 
     pub fn x_offset(&self, column: CharIndex) -> f32 {
         if let Some(glyph) = self.glyphs.get(column.0) {
-            glyph.pos.x
+            // PdfCraft patch: a right-to-left character starts at its right edge.
+            if glyph.is_rtl() { glyph.max_x() } else { glyph.pos.x }
+        } else if let Some(last) = self.glyphs.last()
+            && last.is_rtl()
+        {
+            // PdfCraft patch: past a right-to-left character is its left edge.
+            last.pos.x
         } else {
             self.size.x
         }
+    }
+
+    /// PdfCraft patch: whether any character on this row runs right to left, so its glyphs
+    /// are in logical order but not left to right on screen.
+    pub fn is_bidi(&self) -> bool {
+        self.glyphs.iter().any(|g| g.bidi_level != 0)
+    }
+
+    /// PdfCraft patch: [`Self::char_at`] for a row whose glyphs are not left to right: the
+    /// character under `desired_x` (or the nearest one), then the cursor before it or after
+    /// it, whichever side of its middle `desired_x` is on in its own direction.
+    fn bidi_char_at(&self, desired_x: f32) -> CharIndex {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, glyph) in self.glyphs.iter().enumerate() {
+            // Zero-width glyphs (marks, ligature continuations) share their base's place.
+            if glyph.advance_width <= 0.0 {
+                continue;
+            }
+            let distance = if desired_x < glyph.pos.x {
+                glyph.pos.x - desired_x
+            } else if glyph.max_x() < desired_x {
+                desired_x - glyph.max_x()
+            } else {
+                0.0
+            };
+            if best.is_none_or(|(_, d)| distance < d) {
+                best = Some((i, distance));
+            }
+        }
+        let Some((i, _)) = best else {
+            return CharIndex(0);
+        };
+        let Some(glyph) = self.glyphs.get(i) else {
+            return CharIndex(0);
+        };
+        let before_middle = desired_x < glyph.pos.x + glyph.advance_width / 2.0;
+        // The cursor after a character skips the zero-width glyphs that belong to it.
+        let after = {
+            let mut j = i + 1;
+            while self.glyphs.get(j).is_some_and(|g| g.advance_width <= 0.0) {
+                j += 1;
+            }
+            j
+        };
+        let before = if glyph.is_rtl() { !before_middle } else { before_middle };
+        CharIndex(if before { i } else { after })
     }
 
     #[inline]
@@ -1148,7 +1236,8 @@ impl Galley {
     /// Zero-width rect past the last character.
     fn end_pos(&self) -> Rect {
         if let Some(row) = self.rows.last() {
-            let x = row.rect().right();
+            // PdfCraft patch: the end of a right-to-left row is on its left.
+            let x = row.pos.x + row.x_offset(row.char_count_excluding_newline());
             Rect::from_min_max(pos2(x, row.min_y()), pos2(x, row.max_y()))
         } else {
             // Empty galley
@@ -1227,6 +1316,21 @@ impl Galley {
 
 /// ## Cursor positions
 impl Galley {
+    /// PdfCraft patch: whether the text at `cursor` runs right to left: the character after it,
+    /// or at the end of a row the one before it ([`LayoutJob::bidi`]). Arrow keys move the
+    /// cursor the way they point on screen, so they swap there.
+    pub fn is_rtl_at(&self, cursor: &CCursor) -> bool {
+        let layout = self.layout_from_cursor(*cursor);
+        let Some(row) = self.rows.get(layout.row) else {
+            return false;
+        };
+        let glyphs = &row.row.glyphs;
+        glyphs
+            .get(layout.column.0)
+            .or_else(|| layout.column.0.checked_sub(1).and_then(|i| glyphs.get(i)))
+            .is_some_and(Glyph::is_rtl)
+    }
+
     /// Cursor to the first character.
     ///
     /// This is the same as [`CCursor::default`].

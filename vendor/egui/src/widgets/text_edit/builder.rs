@@ -485,6 +485,18 @@ impl TextEdit<'_> {
         let prev_text = text.as_str().to_owned();
         let hint_text_str = hint_text.text().unwrap_or_default().to_string();
 
+        // PdfCraft patch: a single-line field whose text starts right to left (Arabic,
+        // Hebrew …) aligns it on the right, as a left-aligned one does left-to-right text.
+        // (A multi-line field's rows align in the layout itself, see `LayoutJob::bidi`.)
+        let align = if !multiline
+            && align.x() == Align::LEFT
+            && epaint::text::starts_right_to_left(&prev_text)
+        {
+            Align2([Align::RIGHT, align.y()])
+        } else {
+            align
+        };
+
         let font_id = font_selection.resolve(ui.style());
         let row_height = ui.fonts_mut(|f| f.row_height(&font_id));
         let line_height = row_height + ui.spacing().extra_text_line_spacing;
@@ -508,6 +520,8 @@ impl TextEdit<'_> {
             layout_job.halign = align.x();
             // We want to keep the trailing whitespace, since hiding it feels really weird when typing
             layout_job.keep_trailing_whitespace = true;
+            // PdfCraft patch: typed text is in logical order, so lay it out bidirectionally.
+            layout_job.bidi = true;
 
             for section in &mut layout_job.sections {
                 section.format.line_height = Some(line_height);
@@ -697,7 +711,8 @@ impl TextEdit<'_> {
                         }
                     })
                     .atom_grow(true)
-                    .atom_align(self.align)
+                    // PdfCraft patch: the alignment above (right for right-to-left text).
+                    .atom_align(align)
                     .atom_id(inner_rect_id)
                     .atom_shrink(should_shrink),
                 );

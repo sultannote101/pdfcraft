@@ -1213,6 +1213,8 @@ impl GalleyCache {
                 },
                 round_output_to_gui: job.round_output_to_gui,
                 keep_trailing_whitespace: job.keep_trailing_whitespace,
+                // PdfCraft patch: each paragraph is laid out with the job's bidi setting.
+                bidi: job.bidi,
             };
 
             // Add overlapping sections:

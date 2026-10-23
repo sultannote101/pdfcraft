@@ -123,6 +123,10 @@ features = ["std"]
 [dependencies.nohash-hasher]
 version = "0.2.0"
 
+# PdfCraft patch: bidirectional text layout (`LayoutJob::bidi`).
+[dependencies.unicode-bidi]
+version = "0.3"
+
 [dependencies.parking_lot]
 version = "0.12.5"
 
